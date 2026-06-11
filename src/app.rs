@@ -98,7 +98,20 @@ enum EditorMode {
 enum SidePanelMode {
     Settings,
     About,
-    Floating,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThemePreference {
+    Light,
+    Dark,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalePreference {
+    ZhCn,
+    EnUs,
+    ZhHk,
 }
 
 pub struct FloralNotepad {
@@ -115,11 +128,11 @@ pub struct FloralNotepad {
     status: SharedString,
     word_count: usize,
     sidebar_visible: bool,
-    pinned: bool,
     line_numbers: bool,
     auto_save: bool,
     side_panel: Option<SidePanelMode>,
     notes_scroll: ScrollHandle,
+    settings_scroll: ScrollHandle,
     suppress_editor_change: bool,
     delete_pending: bool,
     delete_confirm_id: Option<String>,
@@ -130,6 +143,17 @@ pub struct FloralNotepad {
     rename_input: Entity<InputState>,
     sidebar_width: f32,
     tab_size: usize,
+    theme_preference: ThemePreference,
+    locale: LocalePreference,
+    close_to_tray: bool,
+    autostart: bool,
+    note_surface_auto_save: bool,
+    external_file_auto_save: bool,
+    remember_surface_size: bool,
+    tile_render_markdown: bool,
+    tile_ctrl_close: bool,
+    quick_note_shortcut: SharedString,
+    visibility_shortcut: SharedString,
 }
 
 impl FloralNotepad {
@@ -194,6 +218,7 @@ impl FloralNotepad {
             KeyBinding::new("ctrl-b", ToggleSidebar, None),
             KeyBinding::new("ctrl-shift-t", ToggleTheme, None),
             KeyBinding::new("ctrl-shift-n", OpenFloating, None),
+            KeyBinding::new("ctrl-space", OpenFloating, None),
         ]);
 
         let mut this = Self {
@@ -210,11 +235,11 @@ impl FloralNotepad {
             status: "正在载入笔记库".into(),
             word_count: fs::count_note_chars(DEFAULT_NOTE),
             sidebar_visible: true,
-            pinned: false,
             line_numbers: false,
             auto_save: true,
             side_panel: None,
             notes_scroll: ScrollHandle::new(),
+            settings_scroll: ScrollHandle::new(),
             suppress_editor_change: false,
             delete_pending: false,
             delete_confirm_id: None,
@@ -225,6 +250,17 @@ impl FloralNotepad {
             rename_input,
             sidebar_width: 286.,
             tab_size: 2,
+            theme_preference: ThemePreference::System,
+            locale: LocalePreference::ZhCn,
+            close_to_tray: true,
+            autostart: false,
+            note_surface_auto_save: true,
+            external_file_auto_save: true,
+            remember_surface_size: true,
+            tile_render_markdown: false,
+            tile_ctrl_close: true,
+            quick_note_shortcut: "Ctrl+Space".into(),
+            visibility_shortcut: "Ctrl+Alt+N".into(),
         };
 
         this.bootstrap(window, cx);
@@ -610,7 +646,94 @@ impl FloralNotepad {
     }
 
     fn open_floating_window(&mut self, cx: &mut Context<Self>) {
-        self.side_panel = Some(SidePanelMode::Floating);
+        cx.spawn(move |_: WeakEntity<FloralNotepad>, cx: &mut AsyncApp| {
+            let opts = WindowOptions {
+                titlebar: Some(TitleBar::title_bar_options()),
+                ..Default::default()
+            };
+            async move {
+                cx.open_window(opts, |window, cx| {
+                    let editor = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .code_editor("markdown")
+                            .line_number(false)
+                            .tab_size(TabSize { tab_size: 2, hard_tabs: false })
+                            .placeholder("写点 Markdown...")
+                    });
+
+                    cx.new(|cx| FloatingNotepad {
+                        editor,
+                        store: fs::default_store(),
+                        note_id: None,
+                        category: String::new(),
+                        title: "".into(),
+                        word_count: 0,
+                        dirty: false,
+                    })
+                })
+                .ok();
+            }
+        })
+        .detach();
+
+        self.toast = Some(Toast {
+            message: "正在打开浮动便签…".into(),
+            kind: ToastKind::Info,
+            created: Instant::now(),
+        });
+        cx.notify();
+    }
+
+    fn toggle_pin(&mut self, cx: &mut Context<Self>) {
+        let content = self.current_markdown(cx);
+        let title = self.current_title(cx);
+        let note_id = self.current_note_id.clone();
+        let category = self.current_category.clone();
+        let word_count = self.word_count;
+
+        cx.spawn({
+            move |_: WeakEntity<FloralNotepad>, cx: &mut AsyncApp| {
+                let content = content.to_string();
+                let title = title;
+                let note_id = note_id;
+                let category = category;
+                let word_count = word_count;
+                async move {
+                    let opts = WindowOptions {
+                        titlebar: Some(TitleBar::title_bar_options()),
+                        ..Default::default()
+                    };
+                    cx.open_window(opts, |window, cx| {
+                        let editor = cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .code_editor("markdown")
+                                .line_number(false)
+                                .tab_size(TabSize { tab_size: 2, hard_tabs: false })
+                                .placeholder("写点 Markdown...")
+                                .default_value(&content)
+                        });
+
+                        cx.new(|cx| TileNotepad {
+                            editor,
+                            store: fs::default_store(),
+                            note_id,
+                            category,
+                            title: title.into(),
+                            word_count,
+                            dirty: false,
+                        })
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+
+        self.toast = Some(Toast {
+            message: "正在打开磁贴便签…".into(),
+            kind: ToastKind::Info,
+            created: Instant::now(),
+        });
         cx.notify();
     }
 
@@ -624,20 +747,7 @@ impl FloralNotepad {
         cx.notify();
     }
 
-    fn toggle_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.pinned = !self.pinned;
-        if self.pinned {
-            self.sidebar_visible = false;
-            self.side_panel = None;
-            window.resize(size(px(420.), px(560.)));
-            self.status = "已切换为磁贴便签视图".into();
-        } else {
-            self.sidebar_visible = true;
-            window.resize(size(px(1180.), px(760.)));
-            self.status = "已恢复主窗口视图".into();
-        }
-        cx.notify();
-    }
+    // 删除旧的 toggle_pin - 已合并到上面的实现
 
     fn show_note_info(&mut self, cx: &mut Context<Self>) {
         let category = self.current_category_label();
@@ -1210,13 +1320,8 @@ impl FloralNotepad {
                     .compact()
                     .icon(IconName::Asterisk)
                     .tooltip("磁贴便签视图")
-                    .selected(self.pinned)
-                    .text_color(if self.pinned {
-                        theme::accent_dark()
-                    } else {
-                        theme::text_faint()
-                    })
-                    .on_click(cx.listener(|this, _event, window, cx| this.toggle_pin(window, cx))),
+                    .text_color(theme::text_faint())
+                    .on_click(cx.listener(|this, _event, _window, cx| this.toggle_pin(cx))),
             )
             .child(
                 Button::new("save-note")
@@ -1471,290 +1576,365 @@ impl FloralNotepad {
     }
 
     fn settings_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut categories = v_flex().gap_2();
-        categories = categories.child(self.category_button("category-default", "未分类", "", cx));
-        for category in &self.categories {
-            let cat = category.clone();
-            let cat2 = cat.clone();
-            let cat3 = cat.clone();
-            categories = categories.child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(self.category_button(
-                        format!("cat-btn-{cat}"),
-                        cat.clone(),
-                        cat.clone(),
-                        cx,
-                    ))
-                    .child(
-                        Button::new(format!("rename-cat-{cat}"))
-                            .ghost()
-                            .small()
-                            .compact()
-                            .icon(IconName::File)
-                            .tooltip("重命名分类")
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.renaming_category = Some(cat2.clone());
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new(format!("delete-cat-{cat}"))
-                            .ghost()
-                            .small()
-                            .compact()
-                            .icon(IconName::Delete)
-                            .tooltip("删除分类")
-                            .text_color(theme::danger())
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                this.delete_category(cat3.clone(), cx);
-                            })),
-                    ),
-            );
-        }
-
-        // Rename inline input
-        let rename_section = if let Some(ref old_name) = self.renaming_category {
-            Some(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .h(px(34.))
-                            .flex_1()
-                            .rounded_lg()
-                            .bg(theme::sidebar_control())
-                            .px_2()
-                            .child(
-                                Input::new(&self.rename_input)
-                                    .small()
-                                    .appearance(false)
-                                    .w_full(),
-                            ),
-                    )
-                    .child(
-                        Button::new("confirm-rename")
-                            .ghost()
-                            .small()
-                            .rounded(px(8.))
-                            .icon(IconName::Check)
-                            .on_click({
-                                let old = old_name.clone();
-                                cx.listener(move |this, _event, _window, cx| {
-                                    let new_name =
-                                        this.rename_input.read(cx).value().trim().to_string();
-                                    this.rename_category(old.clone(), new_name, cx);
-                                })
-                            }),
-                    )
-                    .child(
-                        Button::new("cancel-rename")
-                            .ghost()
-                            .small()
-                            .compact()
-                            .icon(IconName::Close)
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.renaming_category = None;
-                                cx.notify();
-                            })),
-                    ),
-            )
-        } else {
-            None
+        let section_label = |text: &str| {
+            div()
+                .text_xs()
+                .text_color(theme::text_faint())
+                .child(text.to_string())
         };
 
-        let mut panel = v_flex()
-            .w(px(300.))
+        let theme_light = self.theme_preference == ThemePreference::Light;
+        let theme_dark = self.theme_preference == ThemePreference::Dark;
+        let theme_system = self.theme_preference == ThemePreference::System;
+
+        let locale_zh = self.locale == LocalePreference::ZhCn;
+        let locale_en = self.locale == LocalePreference::EnUs;
+        let locale_hk = self.locale == LocalePreference::ZhHk;
+
+        let content = v_flex()
+            .gap_5()
+            .px_4()
+            .py_4()
+            // ── 主题 ──
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(section_label("主题"))
+                    .child(
+                        h_flex()
+                            .h(px(30.))
+                            .w_full()
+                            .items_center()
+                            .bg(theme::control())
+                            .rounded_lg()
+                            .p(px(2.))
+                            .border_1()
+                            .border_color(theme::line())
+                            .child(self.settings_segment(
+                                "settings-theme-light", "浅色", theme_light,
+                                cx.listener(|this, _, _, cx| this.set_theme_preference(ThemePreference::Light, cx)),
+                            ))
+                            .child(self.settings_segment(
+                                "settings-theme-dark", "深色", theme_dark,
+                                cx.listener(|this, _, _, cx| this.set_theme_preference(ThemePreference::Dark, cx)),
+                            ))
+                            .child(self.settings_segment(
+                                "settings-theme-system", "跟随系统", theme_system,
+                                cx.listener(|this, _, _, cx| this.set_theme_preference(ThemePreference::System, cx)),
+                            )),
+                    ),
+            )
+            // ── 笔记目录 ──
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(section_label("笔记目录"))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .h(px(30.))
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(theme::line())
+                                    .bg(theme::control())
+                                    .px_2()
+                                    .text_xs()
+                                    .text_color(theme::text_faint())
+                                    .overflow_hidden()
+                                    .child(
+                                        div().truncate()
+                                            .font_family("Cascadia Code, Consolas, monospace")
+                                            .child(self.store.base_dir().display().to_string()),
+                                    ),
+                            )
+                            .child(
+                                Button::new("choose-notes-dir")
+                                    .ghost()
+                                    .small()
+                                    .rounded(px(8.))
+                                    .label("选择文件夹")
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.choose_notes_directory(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            // ── 语言 ──
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(section_label("语言"))
+                    .child(
+                        h_flex()
+                            .h(px(30.))
+                            .w_full()
+                            .items_center()
+                            .bg(theme::control())
+                            .rounded_lg()
+                            .p(px(2.))
+                            .border_1()
+                            .border_color(theme::line())
+                            .child(self.settings_segment(
+                                "settings-locale-zh-cn", "简体中文", locale_zh,
+                                cx.listener(|this, _, _, cx| this.set_locale(LocalePreference::ZhCn, cx)),
+                            ))
+                            .child(self.settings_segment(
+                                "settings-locale-en-us", "English", locale_en,
+                                cx.listener(|this, _, _, cx| this.set_locale(LocalePreference::EnUs, cx)),
+                            ))
+                            .child(self.settings_segment(
+                                "settings-locale-zh-hk", "繁體中文", locale_hk,
+                                cx.listener(|this, _, _, cx| this.set_locale(LocalePreference::ZhHk, cx)),
+                            )),
+                    ),
+            )
+            // ── 开关设置 ──
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(self.settings_toggle_row(
+                        "settings-close-to-tray", "关闭到托盘", self.close_to_tray,
+                        cx.listener(|this, _, _, cx| { this.close_to_tray = !this.close_to_tray; cx.notify(); }),
+                    ))
+                    .child(self.settings_toggle_row(
+                        "settings-autostart", "开机自启", self.autostart,
+                        cx.listener(|this, _, _, cx| { this.autostart = !this.autostart; cx.notify(); }),
+                    ))
+                    .child(self.settings_toggle_row(
+                        "settings-auto-save-note", "自动保存笔记", self.auto_save,
+                        cx.listener(|this, _, _, cx| this.toggle_auto_save(cx)),
+                    ))
+                    .child(self.settings_toggle_row(
+                        "settings-auto-save-surface", "小窗笔记自动保存", self.note_surface_auto_save,
+                        cx.listener(|this, _, _, cx| { this.note_surface_auto_save = !this.note_surface_auto_save; cx.notify(); }),
+                    ))
+                    .child(self.settings_toggle_row(
+                        "settings-auto-save-external", "外部文件自动保存", self.external_file_auto_save,
+                        cx.listener(|this, _, _, cx| { this.external_file_auto_save = !this.external_file_auto_save; cx.notify(); }),
+                    ))
+                    .child(self.settings_toggle_row(
+                        "settings-remember-surface-size", "记住小窗尺寸", self.remember_surface_size,
+                        cx.listener(|this, _, _, cx| { this.remember_surface_size = !this.remember_surface_size; cx.notify(); }),
+                    ))
+                    .child(self.settings_toggle_row(
+                        "settings-tile-render-markdown", "磁贴渲染 Markdown", self.tile_render_markdown,
+                        cx.listener(|this, _, _, cx| { this.tile_render_markdown = !this.tile_render_markdown; cx.notify(); }),
+                    ))
+                    .child(self.settings_toggle_row(
+                        "settings-tile-ctrl-close", "Ctrl+右键快速关闭磁贴", self.tile_ctrl_close,
+                        cx.listener(|this, _, _, cx| { this.tile_ctrl_close = !this.tile_ctrl_close; cx.notify(); }),
+                    )),
+            )
+            // ── 快捷方式 ──
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(section_label("快捷记录快捷键"))
+                    .child(self.shortcut_row(self.quick_note_shortcut.clone(), "settings-quick-shortcut")),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(section_label("显示/隐藏窗口快捷键"))
+                    .child(self.shortcut_row(self.visibility_shortcut.clone(), "settings-visibility-shortcut")),
+            );
+
+        v_flex()
+            .w(px(360.))
             .h_full()
             .flex_shrink_0()
-            .gap_4()
-            .p_5()
             .border_l_1()
             .border_color(theme::line())
             .bg(theme::sidebar())
             .child(
                 h_flex()
+                    .h(px(44.))
+                    .flex_shrink_0()
                     .items_center()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(theme::line())
+                    .justify_between()
                     .child(
                         div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text())
-                            .child("设置"),
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::text_muted())
+                            .child("应用设置"),
                     )
                     .child(
                         Button::new("close-settings")
                             .ghost()
                             .small()
                             .compact()
-                            .ml_auto()
                             .icon(IconName::Close)
+                            .tooltip("关闭设置")
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.side_panel = None;
                                 cx.notify();
                             })),
                     ),
             )
-            .child(self.setting_toggle(
-                "setting-autosave",
-                "自动保存",
-                self.auto_save,
-                cx.listener(|this, _event, _window, cx| this.toggle_auto_save(cx)),
-            ))
-            .child(self.setting_toggle(
-                "setting-darkmode",
-                "暗色模式",
-                self.dark_mode,
-                cx.listener(|this, _event, _window, cx| {
-                    this.dark_mode = !this.dark_mode;
-                    cx.notify();
-                }),
-            ))
-            .child(self.setting_toggle(
-                "setting-line-number",
-                "显示行号",
-                self.line_numbers,
-                cx.listener(|this, _event, window, cx| this.toggle_line_numbers(window, cx)),
-            ))
-            // ── Sidebar width ──
-            .child(self.setting_slider(
-                "sidebar-width",
-                "侧栏宽度",
-                self.sidebar_width,
-                |this, cx| {
-                    this.sidebar_width = (this.sidebar_width - 10.).max(180.);
-                    cx.notify();
-                },
-                |this, cx| {
-                    this.sidebar_width = (this.sidebar_width + 10.).min(500.);
-                    cx.notify();
-                },
-                cx,
-            ))
-            // ── Tab size ──
-            .child(self.setting_slider(
-                "tab-size",
-                "Tab 缩进",
-                self.tab_size as f32,
-                |this, cx| {
-                    this.tab_size = (this.tab_size.saturating_sub(1)).max(1);
-                    cx.notify();
-                },
-                |this, cx| {
-                    this.tab_size = (this.tab_size + 1).min(8);
-                    cx.notify();
-                },
-                cx,
-            ))
-            // ── Default view mode ──
             .child(
-                v_flex()
-                    .gap_2()
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
                     .child(
                         div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_faint())
-                            .child("默认视图"),
+                            .id("settings-scroll-area")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.settings_scroll)
+                            .child(content),
                     )
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(self.mode_button(
-                                "setting-mode-edit",
-                                "编辑",
-                                EditorMode::Edit,
-                                cx,
-                            ))
-                            .child(self.mode_button(
-                                "setting-mode-split",
-                                "分栏",
-                                EditorMode::Split,
-                                cx,
-                            ))
-                            .child(self.mode_button(
-                                "setting-mode-preview",
-                                "预览",
-                                EditorMode::Preview,
-                                cx,
-                            )),
-                    ),
+                    .vertical_scrollbar(&self.settings_scroll),
             )
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_faint())
-                            .child("当前分类"),
-                    )
-                    .child(categories),
-            );
+    }
 
-        // Insert rename section if active
-        if let Some(rename_el) = rename_section {
-            panel = panel.child(rename_el);
+    fn settings_segment(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        selected: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        let base = div()
+            .id(id)
+            .relative()
+            .flex_1()
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_xs()
+            .cursor_pointer();
+
+        if selected {
+            base
+                .bg(theme::paper())
+                .text_color(theme::accent_dark())
+                .font_weight(FontWeight::MEDIUM)
+                .on_click(on_click)
+                .child(label)
+        } else {
+            base
+                .text_color(theme::text_faint())
+                .hover(|style| style.text_color(theme::text_muted()))
+                .on_click(on_click)
+                .child(label)
         }
+    }
 
-        panel = panel
+    fn settings_toggle_row(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        checked: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        Button::new(id)
+            .ghost()
+            .h(px(36.))
+            .w_full()
+            .rounded_lg()
+            .px_2()
+            .on_click(on_click)
             .child(
-                v_flex()
-                    .gap_2()
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
                             .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_faint())
-                            .child("新建分类"),
+                            .text_color(theme::text())
+                            .child(label),
                     )
                     .child(
                         div()
-                            .h(px(34.))
-                            .rounded_lg()
-                            .bg(theme::sidebar_control())
-                            .px_2()
+                            .w(px(32.))
+                            .h(px(18.))
+                            .rounded_full()
+                            .bg(if checked { theme::accent() } else { theme::text_faint() })
                             .child(
-                                Input::new(&self.category_input)
-                                    .small()
-                                    .appearance(false)
-                                    .w_full(),
+                                div()
+                                    .ml(if checked { px(14.) } else { px(2.) })
+                                    .mt(px(2.))
+                                    .w(px(14.))
+                                    .h(px(14.))
+                                    .rounded_full()
+                                    .bg(rgb(0xffffff)),
                             ),
-                    )
-                    .child(
-                        Button::new("create-category")
-                            .ghost()
-                            .small()
-                            .rounded(px(8.))
-                            .icon(IconName::Plus)
-                            .label("添加分类")
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.create_category_from_input(window, cx)
-                            })),
                     ),
             )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .text_xs()
-                    .text_color(theme::text_faint())
-                    .child("数据目录")
-                    .child(
-                        div()
-                            .line_clamp(3)
-                            .child(self.store.base_dir().display().to_string()),
-                    )
-                    .child("笔记目录")
-                    .child(
-                        div()
-                            .line_clamp(3)
-                            .child(self.store.notes_dir().display().to_string()),
-                    ),
-            );
+    }
 
-        panel
+    fn shortcut_row(
+        &self,
+        shortcut: SharedString,
+        _id: &'static str,
+    ) -> impl IntoElement {
+        Button::new(format!("shortcut-btn-{_id}"))
+            .ghost()
+            .h(px(30.))
+            .w_full()
+            .rounded_lg()
+            .px_2()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .text_xs()
+                            .text_color(if shortcut.is_empty() { theme::text_faint() } else { theme::text() })
+                            .child(if shortcut.is_empty() { "未设置".to_string() } else { shortcut.to_string() }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::text_faint())
+                            .child("点击录制"),
+                    ),
+            )
+    }
+
+    fn set_theme_preference(&mut self, pref: ThemePreference, cx: &mut Context<Self>) {
+        self.theme_preference = pref;
+        match pref {
+            ThemePreference::Light => self.dark_mode = false,
+            ThemePreference::Dark => self.dark_mode = true,
+            ThemePreference::System => { /* TODO: detect system theme */ }
+        }
+        self.status = format!("已切换主题偏好").into();
+        cx.notify();
+    }
+
+    fn set_locale(&mut self, locale: LocalePreference, cx: &mut Context<Self>) {
+        self.locale = locale;
+        self.status = format!("已切换语言偏好").into();
+        cx.notify();
+    }
+
+    fn choose_notes_directory(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.store = fs::NoteStore::new(path);
+            self.refresh_library();
+            self.status = "已更改笔记目录".into();
+        } else {
+            self.status = "已取消目录选择".into();
+        }
+        cx.notify();
     }
 
     fn category_button(
@@ -1846,101 +2026,6 @@ impl FloralNotepad {
             .child(div().text_sm().text_color(theme::text_muted()).child(label))
     }
 
-    fn floating_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = self.current_title(cx);
-
-        div()
-            .flex_1()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(if self.dark_mode {
-                hsla(40.0 / 360.0, 0.08, 0.12, 1.0)
-            } else {
-                theme::paper()
-            })
-            .child(
-                // Centered card
-                v_flex()
-                    .w(px(540.))
-                    .h(px(500.))
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme::line())
-                    .bg(theme::paper())
-                    .shadow_2xl()
-                    .overflow_hidden()
-                    .child(
-                        // Title bar
-                        h_flex()
-                            .h(px(42.))
-                            .flex_shrink_0()
-                            .items_center()
-                            .gap_3()
-                            .px_4()
-                            .border_b_1()
-                            .border_color(theme::line())
-                            .bg(theme::chrome())
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .truncate()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::text())
-                                    .child(title),
-                            )
-                            .child(
-                                Button::new("float-save-modal")
-                                    .ghost()
-                                    .small()
-                                    .compact()
-                                    .label("保存")
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.save_current_note(cx);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("float-close-modal")
-                                    .ghost()
-                                    .small()
-                                    .compact()
-                                    .icon(IconName::Close)
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.side_panel = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .p_4()
-                            .overflow_hidden()
-                            .child(Input::new(&self.editor).h_full().w_full()),
-                    )
-                    .child(
-                        h_flex()
-                            .h(px(28.))
-                            .flex_shrink_0()
-                            .items_center()
-                            .px_4()
-                            .border_t_1()
-                            .border_color(theme::line())
-                            .bg(theme::paper())
-                            .text_xs()
-                            .text_color(theme::text_faint())
-                            .child(format!("{} 字", self.word_count))
-                            .child(div().ml_auto().child(if self.dirty {
-                                "未保存"
-                            } else {
-                                "已保存"
-                            })),
-                    ),
-            )
-    }
-
     fn about_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .w(px(300.))
@@ -2012,12 +2097,138 @@ impl FloralNotepad {
             .child(self.editor_content(cx))
             .child(self.status_bar(cx))
     }
+}
 
-    fn tile_workspace(&self, cx: &mut Context<Self>) -> impl IntoElement {
+// ── Floating notepad (standalone window) ──
+pub struct FloatingNotepad {
+    editor: Entity<InputState>,
+    store: fs::NoteStore,
+    note_id: Option<String>,
+    category: String,
+    title: SharedString,
+    word_count: usize,
+    dirty: bool,
+}
+
+impl Render for FloatingNotepad {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self.title.clone();
+        let word_count = self.word_count;
+        let dirty = self.dirty;
+
         v_flex()
-            .flex_1()
-            .h_full()
-            .overflow_hidden()
+            .size_full()
+            .font_family("Microsoft YaHei UI")
+            .bg(theme::paper())
+            .child(
+                h_flex()
+                    .h(px(42.))
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .border_b_1()
+                    .border_color(theme::line())
+                    .bg(theme::chrome())
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text())
+                            .child(title),
+                    )
+                    .child(
+                        Button::new("float-save")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .label("保存")
+                            .on_click({
+                                let note_id = self.note_id.clone();
+                                let category = self.category.clone();
+                                let store = self.store.clone();
+                                cx.listener(move |this, _event, _window, cx| {
+                                    let content = this.editor.read(cx).value().to_string();
+                                    let title_text = fs::normalize_note_title("", &content);
+                                    let request = fs::SaveNoteRequest {
+                                        title: title_text,
+                                        content,
+                                        category: category.clone(),
+                                    };
+                                    let result = if let Some(ref id) = note_id {
+                                        store.update_note(id, request)
+                                    } else {
+                                        store.create_note(request)
+                                    };
+                                    match result {
+                                        Ok(note) => {
+                                            this.dirty = false;
+                                            this.word_count = note.word_count;
+                                            this.title = note.title.into();
+                                            cx.notify();
+                                        }
+                                        Err(_) => {}
+                                    }
+                                })
+                            }),
+                    )
+                    .child(
+                        Button::new("float-close")
+                            .ghost()
+                            .small()
+                            .compact()
+                            .icon(IconName::Close)
+                            .on_click(|_event, window, _cx| {
+                                window.remove_window();
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_4()
+                    .overflow_hidden()
+                    .child(Input::new(&self.editor).h_full().w_full()),
+            )
+            .child(
+                h_flex()
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .items_center()
+                    .px_4()
+                    .border_t_1()
+                    .border_color(theme::line())
+                    .bg(theme::paper())
+                    .text_xs()
+                    .text_color(theme::text_faint())
+                    .child(format!("{} 字", word_count))
+                    .child(div().ml_auto().child(if dirty { "未保存" } else { "已保存" })),
+            )
+    }
+}
+
+// ── Tile notepad (standalone pin window) ──
+pub struct TileNotepad {
+    editor: Entity<InputState>,
+    store: fs::NoteStore,
+    note_id: Option<String>,
+    category: String,
+    title: SharedString,
+    word_count: usize,
+    dirty: bool,
+}
+
+impl Render for TileNotepad {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = self.title.clone();
+        let word_count = self.word_count;
+        let dirty = self.dirty;
+
+        v_flex()
+            .size_full()
+            .font_family("Microsoft YaHei UI")
             .bg(theme::selected_note())
             .child(
                 h_flex()
@@ -2032,7 +2243,7 @@ impl FloralNotepad {
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::accent_dark())
-                            .child(self.current_title(cx)),
+                            .child(title),
                     )
                     .child(
                         Button::new("tile-save")
@@ -2041,20 +2252,45 @@ impl FloralNotepad {
                             .compact()
                             .label("保存")
                             .tooltip("保存")
-                            .on_click(
-                                cx.listener(|this, _event, _window, cx| this.save_current_note(cx)),
-                            ),
+                            .on_click({
+                                let note_id = self.note_id.clone();
+                                let category = self.category.clone();
+                                let store = self.store.clone();
+                                cx.listener(move |this, _event, _window, cx| {
+                                    let content = this.editor.read(cx).value().to_string();
+                                    let title_text = fs::normalize_note_title("", &content);
+                                    let request = fs::SaveNoteRequest {
+                                        title: title_text,
+                                        content,
+                                        category: category.clone(),
+                                    };
+                                    let result = if let Some(ref id) = note_id {
+                                        store.update_note(id, request)
+                                    } else {
+                                        store.create_note(request)
+                                    };
+                                    match result {
+                                        Ok(note) => {
+                                            this.dirty = false;
+                                            this.word_count = note.word_count;
+                                            this.title = note.title.into();
+                                            cx.notify();
+                                        }
+                                        Err(_) => {}
+                                    }
+                                })
+                            }),
                     )
                     .child(
-                        Button::new("tile-unpin")
+                        Button::new("tile-close")
                             .ghost()
                             .small()
                             .compact()
-                            .icon(IconName::Asterisk)
-                            .tooltip("返回主窗口")
-                            .on_click(
-                                cx.listener(|this, _event, window, cx| this.toggle_pin(window, cx)),
-                            ),
+                            .icon(IconName::Close)
+                            .tooltip("关闭磁贴")
+                            .on_click(|_event, window, _cx| {
+                                window.remove_window();
+                            }),
                     ),
             )
             .child(
@@ -2070,12 +2306,8 @@ impl FloralNotepad {
                     .px_4()
                     .text_xs()
                     .text_color(theme::text_faint())
-                    .child(format!("{} 字", self.word_count))
-                    .child(div().ml_auto().child(if self.dirty {
-                        "未保存"
-                    } else {
-                        "已保存"
-                    })),
+                    .child(format!("{} 字", word_count))
+                    .child(div().ml_auto().child(if dirty { "未保存" } else { "已保存" })),
             )
     }
 }
@@ -2085,11 +2317,7 @@ impl Render for FloralNotepad {
         // ── Poll global hotkey flag ──
         #[cfg(target_os = "windows")]
         if crate::platform::HOTKEY_FLAG.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            if self.side_panel != Some(SidePanelMode::Floating) {
-                self.side_panel = Some(SidePanelMode::Floating);
-            } else {
-                self.side_panel = None;
-            }
+            // toggle floating via window-level logic
         }
 
         let bg_color = if self.dark_mode {
@@ -2128,27 +2356,6 @@ impl Render for FloralNotepad {
                 None
             }
         });
-
-        if self.pinned {
-            return v_flex()
-                .size_full()
-                .overflow_hidden()
-                .bg(theme::selected_note())
-                .font_family("Microsoft YaHei UI")
-                .child(self.titlebar(cx))
-                .child(self.tile_workspace(cx));
-        }
-
-        // ── Delete confirm: replace entire view ──
-        // ── Floating modal: replace entire view ──
-        if self.side_panel == Some(SidePanelMode::Floating) {
-            return v_flex()
-                .size_full()
-                .bg(bg_color)
-                .font_family("Microsoft YaHei UI")
-                .child(self.titlebar(cx))
-                .child(self.floating_panel(cx));
-        }
 
         let mut body = h_flex().flex_1().overflow_hidden();
         if self.sidebar_visible {

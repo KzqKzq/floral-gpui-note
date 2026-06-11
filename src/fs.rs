@@ -76,6 +76,10 @@ pub fn pick_export_path(title: &str) -> Option<PathBuf> {
     )
 }
 
+pub fn pick_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new().pick_folder()
+}
+
 fn normalize_markdown_extension(mut path: PathBuf) -> Option<PathBuf> {
     if path.extension().is_none() {
         path.set_extension("md");
